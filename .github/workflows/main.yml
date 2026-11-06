@@ -1,0 +1,142 @@
+
+name: Windows Cloud Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_authkey:
+        description: "Temporary Tailscale auth key"
+        required: true
+        type: string
+      rdp_password:
+        description: "Temporary RDP password"
+        required: true
+        type: string
+      game_download_url:
+        description: "Optional direct HTTPS download URL"
+        required: false
+        type: string
+
+jobs:
+  cloud-runner:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+          $Password = ConvertTo-SecureString '${{ inputs.rdp_password }}' -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $Password -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $Password
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest $url -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -Wait -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet"
+
+          Start-Service Tailscale
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey='${{ inputs.tailscale_authkey }}' `
+            --hostname="cloud-runner"
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+      - name: Install Visual C++ Runtimes
+        shell: powershell
+        run: |
+          $urls = @(
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            "https://aka.ms/vs/17/release/vc_redist.x86.exe"
+          )
+
+          foreach ($url in $urls) {
+            $file = "$env:TEMP\$([guid]::NewGuid()).exe"
+            Invoke-WebRequest $url -OutFile $file
+            Start-Process $file -ArgumentList "/install /quiet /norestart" -Wait
+          }
+
+      - name: Install 7-Zip
+        shell: powershell
+        run: |
+          winget install --id 7zip.7zip `
+            --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Disk Cleanup
+        shell: powershell
+        run: |
+          Write-Host "Cleaning temporary files..."
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Disk space:"
+          Get-PSDrive C
+
+      - name: Optional Game Download
+        if: ${{ inputs.game_download_url != '' }}
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\GameDownloads" | Out-Null
+
+          $url = '${{ inputs.game_download_url }}'
+          if ($url -notmatch '^https://') {
+            throw "Only HTTPS download URLs are allowed."
+          }
+
+          $file = "C:\GameDownloads\downloaded-file"
+          Invoke-WebRequest -Uri $url -OutFile $file
+
+          Write-Host "Download completed. File saved to C:\GameDownloads"
+
+      - name: Hardware Information
+        shell: powershell
+        run: |
+          Write-Host "CPU:"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores
+
+          Write-Host "RAM:"
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object @{N="RAM_GB";E={[math]::Round($_.TotalPhysicalMemory / 1GB, 2)}}
+
+          Write-Host "GPU:"
+          Get-CimInstance Win32_VideoController | Select-Object Name
+
+          Write-Host "Disk:"
+          Get-PSDrive C
+
+      - name: Performance Monitoring
+        shell: powershell
+        run: |
+          while ($true) {
+            Clear-Host
+
+            Get-CimInstance Win32_Processor |
+              Select-Object LoadPercentage
+
+            Get-CimInstance Win32_OperatingSystem |
+              Select-Object @{N="FreeRAM_GB";E={[math]::Round($_.FreePhysicalMemory / 1MB, 2)}}
+
+            Get-PSDrive C |
+              Select-Object Used, Free
+
+            Start-Sleep -Seconds 30
+          }
