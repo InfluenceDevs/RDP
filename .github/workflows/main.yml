@@ -1,5 +1,5 @@
 
-name: Windows 2022 + Tailscale + RDP
+name: Windows latest + Tailscale + RDP
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   secure-rdp:
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 350
 
     env:
