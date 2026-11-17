@@ -1,142 +1,192 @@
 
-name: Windows Cloud Runner
+name: Windows 2022 + Tailscale + RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      tailscale_authkey:
-        description: "Temporary Tailscale auth key"
-        required: true
-        type: string
-      rdp_password:
-        description: "Temporary RDP password"
-        required: true
-        type: string
-      game_download_url:
-        description: "Optional direct HTTPS download URL"
-        required: false
-        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  cloud-runner:
+  secure-rdp:
     runs-on: windows-2022
     timeout-minutes: 350
 
-    steps:
-      - name: Configure Remote Desktop
-        shell: powershell
-        run: |
-          $Password = ConvertTo-SecureString '${{ inputs.rdp_password }}' -AsPlainText -Force
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $Password -PasswordNeverExpires
-          } else {
-            Set-LocalUser -Name "RDP" -Password $Password
+    steps:
+      - name: Validate secrets
+        shell: pwsh
+        run: |
+          if (!$env:TAILSCALE_AUTHKEY) {
+            throw "Missing TAILSCALE_AUTHKEY secret"
+          }
+          if (!$env:RDP_PASSWORD -or $env:RDP_PASSWORD.Length -lt 20) {
+            throw "RDP_PASSWORD must be at least 20 characters"
           }
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+      - name: Configure secure RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
           Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
 
           Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" -Value 1
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name SecurityLayer -Value 2
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          Start-Service TermService
+
+      - name: Create RDP account
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (!(Get-LocalUser RDP -ErrorAction SilentlyContinue)) {
+            New-LocalUser RDP -Password $password `
+              -Description "Temporary RDP account"
+          } else {
+            Set-LocalUser RDP -Password $password
+            Enable-LocalUser RDP
+          }
+
+          $member = Get-LocalGroupMember "Remote Desktop Users" |
+            Where-Object { $_.Name -match '\\RDP$' }
+
+          if (!$member) {
+            Add-LocalGroupMember "Remote Desktop Users" RDP
+          }
+
+          $admin = Get-LocalGroupMember Administrators |
+            Where-Object { $_.Name -match '\\RDP$' }
+
+          if ($admin) {
+            Remove-LocalGroupMember Administrators RDP
+          }
 
       - name: Install Tailscale
-        shell: powershell
+        shell: pwsh
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          Invoke-WebRequest $url -OutFile "$env:TEMP\tailscale.msi"
-          Start-Process msiexec.exe -Wait -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet"
+          $ErrorActionPreference = "Stop"
 
-          Start-Service Tailscale
+          $installer = "$env:TEMP\tailscale.msi"
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey='${{ inputs.tailscale_authkey }}' `
-            --hostname="cloud-runner"
+          Invoke-WebRequest `
+            'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $installer
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $signature = Get-AuthenticodeSignature $installer
 
-      - name: Install Visual C++ Runtimes
-        shell: powershell
-        run: |
-          $urls = @(
-            "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-            "https://aka.ms/vs/17/release/vc_redist.x86.exe"
-          )
-
-          foreach ($url in $urls) {
-            $file = "$env:TEMP\$([guid]::NewGuid()).exe"
-            Invoke-WebRequest $url -OutFile $file
-            Start-Process $file -ArgumentList "/install /quiet /norestart" -Wait
+          if ($signature.Status -ne 'Valid' -or
+              $signature.SignerCertificate.Subject -notmatch 'Tailscale') {
+            throw "Invalid Tailscale installer signature"
           }
 
-      - name: Install 7-Zip
-        shell: powershell
-        run: |
-          winget install --id 7zip.7zip `
-            --silent --accept-package-agreements --accept-source-agreements
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait -PassThru
 
-      - name: Disk Cleanup
-        shell: powershell
-        run: |
-          Write-Host "Cleaning temporary files..."
-          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $installer -Force
 
-          Write-Host "Disk space:"
-          Get-PSDrive C
-
-      - name: Optional Game Download
-        if: ${{ inputs.game_download_url != '' }}
-        shell: powershell
-        run: |
-          New-Item -ItemType Directory -Force -Path "C:\GameDownloads" | Out-Null
-
-          $url = '${{ inputs.game_download_url }}'
-          if ($url -notmatch '^https://') {
-            throw "Only HTTPS download URLs are allowed."
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed"
           }
 
-          $file = "C:\GameDownloads\downloaded-file"
-          Invoke-WebRequest -Uri $url -OutFile $file
-
-          Write-Host "Download completed. File saved to C:\GameDownloads"
-
-      - name: Hardware Information
-        shell: powershell
+      - name: Connect Tailscale
+        shell: pwsh
         run: |
-          Write-Host "CPU:"
-          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "RAM:"
-          Get-CimInstance Win32_ComputerSystem |
-            Select-Object @{N="RAM_GB";E={[math]::Round($_.TotalPhysicalMemory / 1GB, 2)}}
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          Write-Host "GPU:"
-          Get-CimInstance Win32_VideoController | Select-Object Name
+          & $ts up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+            "--accept-routes=false" `
+            "--ssh=false"
 
-          Write-Host "Disk:"
-          Get-PSDrive C
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
 
-      - name: Performance Monitoring
-        shell: powershell
+          $ip = $null
+
+          for ($i = 0; $i -lt 30 -and !$ip; $i++) {
+            Start-Sleep 2
+            $result = & $ts ip -4
+            if ($result) {
+              $ip = ($result | Select-Object -First 1).Trim()
+            }
+          }
+
+          if (!$ip) {
+            throw "Tailscale IP unavailable"
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        shell: pwsh
         run: |
+          if ((Get-Service TermService).Status -ne 'Running') {
+            throw "RDP service is not running"
+          }
+
+          $listener = Get-NetTCPConnection `
+            -State Listen -LocalPort 3389 `
+            -ErrorAction SilentlyContinue
+
+          if (!$listener) {
+            throw "RDP listener unavailable"
+          }
+
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+
+      - name: Keep runner alive
+        shell: pwsh
+        run: |
+          Write-Host "================================"
+          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
+          Write-Host "USERNAME: RDP"
+          Write-Host "PASSWORD: GitHub RDP_PASSWORD secret"
+          Write-Host "================================"
+
           while ($true) {
-            Clear-Host
+            Write-Host "[$(Get-Date)] Runner active"
+            Start-Sleep -Seconds 300
+          }
 
-            Get-CimInstance Win32_Processor |
-              Select-Object LoadPercentage
-
-            Get-CimInstance Win32_OperatingSystem |
-              Select-Object @{N="FreeRAM_GB";E={[math]::Round($_.FreePhysicalMemory / 1MB, 2)}}
-
-            Get-PSDrive C |
-              Select-Object Used, Free
-
-            Start-Sleep -Seconds 30
+      - name: Disconnect Tailscale
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout
           }
